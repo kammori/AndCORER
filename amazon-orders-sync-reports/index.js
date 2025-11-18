@@ -534,7 +534,7 @@ async function insertToTempTable(orders) {
  * MERGEで本テーブルに統合
  */
 async function mergeToMainTables(channel) {
-  // orders テーブルへのMERGE（修正版）
+  // orders テーブルへのMERGE修正版
   const ordersMergeQuery = `
     MERGE \`${datasetId}.${ordersTableId}\` T
     USING (
