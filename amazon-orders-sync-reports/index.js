@@ -534,53 +534,53 @@ async function insertToTempTable(orders) {
  * MERGEで本テーブルに統合
  */
 async function mergeToMainTables(channel) {
-  // orders テーブルへのMERGE修正版
+  // ■ orders テーブルへのMERGE
+  // 変更なし（ここは既に安全に集計されるようになっています）
   const ordersMergeQuery = `
     MERGE \`${datasetId}.${ordersTableId}\` T
     USING (
-      SELECT DISTINCT
+      SELECT
         order_id,
         channel,
-        account_name,
-        order_number,
-        order_date,
-        customer_name,
-        ship_state,
-        ship_city,
-        ship_postal_code,
-        subtotal_amount,
-        tax_amount,
-        shipping_amount,
-        total_amount,
-        currency,
-        payment_status,
-        fulfillment_status,
-        created_at,
-        updated_at
+        ANY_VALUE(account_name) as account_name,
+        ANY_VALUE(order_number) as order_number,
+        MAX(order_date) as order_date,
+        ANY_VALUE(customer_name) as customer_name,
+        ANY_VALUE(ship_state) as ship_state,
+        ANY_VALUE(ship_city) as ship_city,
+        ANY_VALUE(ship_postal_code) as ship_postal_code,
+        SUM(subtotal_amount) as subtotal_amount,
+        SUM(tax_amount) as tax_amount,
+        SUM(shipping_amount) as shipping_amount,
+        SUM(total_amount) as total_amount,
+        ANY_VALUE(currency) as currency,
+        ANY_VALUE(payment_status) as payment_status,
+        ANY_VALUE(fulfillment_status) as fulfillment_status,
+        MAX(created_at) as created_at,
+        CURRENT_TIMESTAMP() as updated_at
       FROM (
-        -- 注文レベルで集約（商品明細を無視）
-        SELECT 
+        SELECT DISTINCT
           order_id,
           channel,
-          ANY_VALUE(account_name) as account_name,
-          ANY_VALUE(order_number) as order_number,
-          ANY_VALUE(order_date) as order_date,
-          ANY_VALUE(customer_name) as customer_name,
-          ANY_VALUE(ship_state) as ship_state,
-          ANY_VALUE(ship_city) as ship_city,
-          ANY_VALUE(ship_postal_code) as ship_postal_code,
-          SUM(subtotal_amount) as subtotal_amount,
-          SUM(tax_amount) as tax_amount,
-          SUM(shipping_amount) as shipping_amount,
-          SUM(total_amount) as total_amount,
-          ANY_VALUE(currency) as currency,
-          ANY_VALUE(payment_status) as payment_status,
-          ANY_VALUE(fulfillment_status) as fulfillment_status,
-          ANY_VALUE(created_at) as created_at,
-          ANY_VALUE(updated_at) as updated_at
+          line_item_id,
+          account_name,
+          order_number,
+          order_date,
+          customer_name,
+          ship_state,
+          ship_city,
+          ship_postal_code,
+          subtotal_amount,
+          tax_amount,
+          shipping_amount,
+          total_amount,
+          currency,
+          payment_status,
+          fulfillment_status,
+          created_at
         FROM \`${datasetId}.${tempTableId}\`
-        GROUP BY order_id, channel
       )
+      GROUP BY order_id, channel
     ) S
     ON T.order_id = S.order_id AND T.channel = S.channel
     WHEN MATCHED THEN
@@ -598,7 +598,7 @@ async function mergeToMainTables(channel) {
         currency = S.currency,
         payment_status = S.payment_status,
         fulfillment_status = S.fulfillment_status,
-        updated_at = CURRENT_TIMESTAMP()
+        updated_at = S.updated_at
     WHEN NOT MATCHED THEN
       INSERT (
         order_id, channel, account_name, order_number, order_date,
@@ -619,7 +619,11 @@ async function mergeToMainTables(channel) {
   const [ordersJob] = await bigquery.createQueryJob({ query: ordersMergeQuery });
   await ordersJob.getQueryResults();
 
-  // order_items テーブルへのMERGE（変更なし）
+  // ■ order_items テーブルへのMERGE
+  // 修正点: 重複排除（QUALIFY）を復活させました。
+  // 解説: line_item_id はAmazon側で一意のIDです。
+  // ここで重複が出る＝通信エラー等で同じ行を2回取得してしまった、という意味です。
+  // なので、エラーで止めるのではなく「最新の1つ」を採用するのが正しい処理です。
   const itemsMergeQuery = `
     MERGE \`${datasetId}.${orderItemsTableId}\` T
     USING (
@@ -637,6 +641,8 @@ async function mergeToMainTables(channel) {
         quantity as quantity_unfulfilled,
         created_at
       FROM \`${datasetId}.${tempTableId}\`
+      -- ここで重複排除を行います
+      QUALIFY ROW_NUMBER() OVER (PARTITION BY order_id, line_item_id ORDER BY created_at DESC) = 1
     ) S
     ON T.order_id = S.order_id AND T.channel = S.channel AND T.line_item_id = S.line_item_id
     WHEN MATCHED THEN
