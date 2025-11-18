@@ -4,6 +4,7 @@
   "description": "Amazon SP-API注文同期（Reports API版）",
   "main": "index.js",
   "scripts": {
+    "start": "functions-framework --target=syncAmazonOrdersReports",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "dependencies": {
