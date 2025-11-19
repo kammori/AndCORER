@@ -93,6 +93,7 @@ async function saveInventoryToBigQuery(inventoryData) {
     const [tempTable] = await bigquery.dataset(datasetId).createTable(tempTableId, {
       schema: [
         { name: 'sku', type: 'STRING', mode: 'REQUIRED' },
+        { name: 'asin', type: 'STRING' },
         { name: 'location', type: 'STRING', mode: 'REQUIRED' },
         { name: 'location_type', type: 'STRING' },
         { name: 'available_quantity', type: 'INTEGER' },
@@ -128,6 +129,7 @@ async function saveInventoryToBigQuery(inventoryData) {
       USING (
         SELECT DISTINCT
           sku,
+          asin,
           location,
           location_type,
           available_quantity,
@@ -141,6 +143,7 @@ async function saveInventoryToBigQuery(inventoryData) {
       ON T.sku = S.sku AND T.location = S.location
       WHEN MATCHED THEN
         UPDATE SET
+          asin = S.asin,
           available_quantity = S.available_quantity,
           reserved_quantity = S.reserved_quantity,
           inbound_quantity = S.inbound_quantity,
@@ -149,12 +152,12 @@ async function saveInventoryToBigQuery(inventoryData) {
           sync_status = S.sync_status
       WHEN NOT MATCHED THEN
         INSERT (
-          sku, location, location_type,
+          sku, asin, location, location_type,
           available_quantity, reserved_quantity, inbound_quantity, total_quantity,
           last_updated, sync_status
         )
         VALUES (
-          S.sku, S.location, S.location_type,
+          S.sku, S.asin, S.location, S.location_type,
           S.available_quantity, S.reserved_quantity, S.inbound_quantity, S.total_quantity,
           S.last_updated, S.sync_status
         )
@@ -225,11 +228,13 @@ exports.syncAmazonFBAInventory = async (req, res) => {
     // 3. データ整形
     console.log('🔄 データ整形中...');
     const inventoryData = inventorySummaries.map(item => {
-      const fnSku = item.fnSku || item.sellerSku;
+      const sku = item.sellerSku || item.fnSku;
+      const asin = item.asin;
       const condition = item.condition || 'NEW';
       
       return {
-        sku: fnSku,
+        sku: sku,
+        asin: asin,
         location: `FBA-${marketplace}-${accountNum}`,
         location_type: 'FBA',
         available_quantity: item.totalQuantity || 0,
