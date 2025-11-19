@@ -125,43 +125,46 @@ async function saveInventoryToBigQuery(inventoryData) {
     // 4. MERGE実行
     console.log('🔄 MERGE実行中...');
     const mergeQuery = `
-      MERGE \`${projectId}.${datasetId}.inventory\` T
-      USING (
+    MERGE \`${projectId}.${datasetId}.inventory\` T
+    USING (
         SELECT DISTINCT
-          sku,
-          location,
-          location_type,
-          available_quantity,
-          reserved_quantity,
-          inbound_quantity,
-          total_quantity,
-          last_updated,
-          sync_status
+        sku,
+        location,
+        location_type,
+        available_quantity,
+        reserved_quantity,
+        inbound_quantity,
+        total_quantity,
+        last_updated,
+        sync_status
         FROM \`${projectId}.${datasetId}.${tempTableId}\`
-      ) S
-      ON T.sku = S.sku AND T.location = S.location
-      WHEN MATCHED THEN
+    ) S
+    ON T.sku = S.sku AND T.location = S.location
+    WHEN MATCHED THEN
         UPDATE SET
-          available_quantity = S.available_quantity,
-          reserved_quantity = S.reserved_quantity,
-          inbound_quantity = S.inbound_quantity,
-          total_quantity = S.total_quantity,
-          last_updated = S.last_updated,
-          sync_status = S.sync_status
-      WHEN NOT MATCHED THEN
+        available_quantity = S.available_quantity,
+        reserved_quantity = S.reserved_quantity,
+        inbound_quantity = S.inbound_quantity,
+        total_quantity = S.total_quantity,
+        last_updated = S.last_updated,
+        sync_status = S.sync_status
+    WHEN NOT MATCHED THEN
         INSERT (
-          sku, location, location_type,
-          available_quantity, reserved_quantity, inbound_quantity, total_quantity,
-          last_updated, sync_status
+        sku, location, location_type,
+        available_quantity, reserved_quantity, inbound_quantity, total_quantity,
+        last_updated, sync_status
         )
         VALUES (
-          S.sku, S.location, S.location_type,
-          S.available_quantity, S.reserved_quantity, S.inbound_quantity, S.total_quantity,
-          S.last_updated, S.sync_status
+        S.sku, S.location, S.location_type,
+        S.available_quantity, S.reserved_quantity, S.inbound_quantity, S.total_quantity,
+        S.last_updated, S.sync_status
         )
     `;
-    
-    const [job] = await bigquery.createQueryJob({ query: mergeQuery });
+
+    const [job] = await bigquery.createQueryJob({ 
+    query: mergeQuery,
+    location: 'asia-northeast2'  // ← これを追加
+    });
     await job.getQueryResults();
     console.log('✅ MERGE完了');
     
