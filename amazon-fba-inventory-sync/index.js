@@ -4,180 +4,270 @@ const axios = require('axios');
 const bigquery = new BigQuery();
 const datasetId = 'andcore_main';
 
+// Amazon SP-API設定
+const MARKETPLACE_IDS = {
+  JP: 'A1VC38T7YXB528',
+  US: 'ATVPDKIKX0DER',
+  CA: 'A2EUQ1WTGCTBG2',
+  MX: 'A1AM78C64UM0Y8'
+};
+
+const ENDPOINTS = {
+  JP: 'https://sellingpartnerapi-fe.amazon.com',
+  US: 'https://sellingpartnerapi-na.amazon.com',
+  CA: 'https://sellingpartnerapi-na.amazon.com',
+  MX: 'https://sellingpartnerapi-na.amazon.com'
+};
+
 /**
- * 在庫切れアラート機能
- * 
- * 機能:
- * - 過去30日の販売数から在庫切れ予測
- * - Critical/Warning判定
- * - Slack通知
- * - stockout_alertテーブルに記録
+ * Amazon LWA Access Token取得
  */
-exports.checkStockoutAlert = async (req, res) => {
-  console.log('🚨 在庫切れアラートチェック開始');
-  console.log('📅 実行日時:', new Date().toISOString());
+async function getAccessToken(clientId, clientSecret, refreshToken) {
+  try {
+    const response = await axios.post('https://api.amazon.com/auth/o2/token', {
+      grant_type: 'refresh_token',
+      refresh_token: refreshToken,
+      client_id: clientId,
+      client_secret: clientSecret
+    }, {
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
+    });
+    
+    return response.data.access_token;
+  } catch (error) {
+    console.error('Access Token取得エラー:', error.response?.data || error.message);
+    throw error;
+  }
+}
+
+/**
+ * FBA在庫データ取得
+ */
+async function getFBAInventory(accessToken, marketplace, accountNum) {
+  const marketplaceId = MARKETPLACE_IDS[marketplace];
+  const endpoint = ENDPOINTS[marketplace];
+  
+  const url = `${endpoint}/fba/inventory/v1/summaries`;
   
   try {
-    // 1. 過去30日の販売データを集計（master_sku単位）
-    console.log('📊 過去30日の販売データ集計中...');
-    const salesQuery = `
-      WITH sales_summary AS (
-        SELECT
-          cs.master_sku,
-          pm.product_name,
-          SUM(oi.quantity) as total_sold,
-          COUNT(DISTINCT DATE(o.order_date)) as sales_days,
-          SUM(oi.quantity) / 30.0 as daily_avg_sales
-        FROM \`${datasetId}.order_items\` oi
-        JOIN \`${datasetId}.orders\` o 
-          ON oi.order_id = o.order_id AND oi.channel = o.channel
-        LEFT JOIN \`${datasetId}.channel_settings\` cs
-          ON oi.sku = cs.channel_sku AND o.account_name = cs.account_name
-        LEFT JOIN \`${datasetId}.product_master\` pm
-          ON cs.master_sku = pm.master_sku
-        WHERE o.order_date >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)
-          AND cs.master_sku IS NOT NULL
-        GROUP BY cs.master_sku, pm.product_name
-        HAVING SUM(oi.quantity) > 0
-      )
-      SELECT * FROM sales_summary
-      ORDER BY daily_avg_sales DESC
-    `;
-    
-    const [salesResults] = await bigquery.query(salesQuery);
-    console.log(`✅ 販売データ取得: ${salesResults.length}商品（master_sku単位）`);
-    
-    // 2. 現在の在庫データを取得（master_sku単位、二重計上回避）
-    console.log('📦 現在の在庫データ取得中...');
-    const inventoryQuery = `
-      WITH unique_sku_map AS (
-        -- SKU文字列が同じなら、どのアカウント設定でも同じMasterSKUを指すと仮定して重複を排除
-        SELECT DISTINCT channel_sku, master_sku
-        FROM \`${datasetId}.channel_settings\`
-        WHERE master_sku IS NOT NULL
-      )
-      SELECT
-        map.master_sku,
-        inv.location,
-        inv.location_type,
-        inv.available_quantity,
-        inv.reserved_quantity,
-        inv.inbound_quantity,
-        inv.total_quantity
-      FROM \`${datasetId}.inventory\` inv
-      JOIN unique_sku_map map
-        ON inv.sku = map.channel_sku
-      WHERE (inv.available_quantity > 0 OR inv.inbound_quantity > 0)
-    `;
-    
-    const [inventoryResults] = await bigquery.query(inventoryQuery);
-    console.log(`✅ 在庫データ取得: ${inventoryResults.length}件`);
-    
-    // 3. master_sku単位で在庫を集計
-    const inventoryByMasterSku = {};
-    inventoryResults.forEach(item => {
-      if (!inventoryByMasterSku[item.master_sku]) {
-        inventoryByMasterSku[item.master_sku] = {
-          available: 0,
-          inbound: 0,
-          total: 0,
-          locations: []
-        };
-      }
-      inventoryByMasterSku[item.master_sku].available += item.available_quantity;
-      inventoryByMasterSku[item.master_sku].inbound += item.inbound_quantity;
-      inventoryByMasterSku[item.master_sku].total += item.total_quantity;
-      inventoryByMasterSku[item.master_sku].locations.push({
-        location: item.location,
-        available: item.available_quantity
-      });
-    });
-    
-    // 4. 在庫切れ予測計算（master_sku単位）
-    console.log('🔮 在庫切れ予測計算中...');
-    const alerts = [];
-    
-    salesResults.forEach(sale => {
-      const inventory = inventoryByMasterSku[sale.master_sku];
-      
-      if (!inventory || inventory.available === 0) {
-        // 在庫なし（すでに切れている）
-        alerts.push({
-          master_sku: sale.master_sku,
-          product_name: sale.product_name || sale.master_sku,
-          current_stock: 0,
-          inbound_stock: inventory ? inventory.inbound : 0,
-          daily_sales_rate: sale.daily_avg_sales,
-          days_until_stockout: 0,
-          alert_level: 'CRITICAL',
-          suggested_order_qty: Math.ceil(sale.daily_avg_sales * 30),
-          message: '🔴 在庫切れ中'
-        });
-      } else {
-        const daysUntilStockout = Math.floor(inventory.available / sale.daily_avg_sales);
-        
-        let alertLevel = 'NORMAL';
-        let message = '';
-        
-        if (daysUntilStockout <= 7) {
-          alertLevel = 'CRITICAL';
-          message = `🔴 あと${daysUntilStockout}日で在庫切れ`;
-        } else if (daysUntilStockout <= 14) {
-          alertLevel = 'WARNING';
-          message = `⚠️ あと${daysUntilStockout}日で在庫切れ`;
-        }
-        
-        if (alertLevel !== 'NORMAL') {
-          alerts.push({
-            master_sku: sale.master_sku,
-            product_name: sale.product_name || sale.master_sku,
-            current_stock: inventory.available,
-            inbound_stock: inventory.inbound,
-            daily_sales_rate: parseFloat(sale.daily_avg_sales.toFixed(2)),
-            days_until_stockout: daysUntilStockout,
-            alert_level: alertLevel,
-            suggested_order_qty: Math.ceil(sale.daily_avg_sales * 30) - inventory.available - inventory.inbound,
-            message: message
-          });
-        }
-      }
-    });
-    
-    console.log(`⚠️ アラート対象: ${alerts.length}商品`);
-    console.log(`   🔴 CRITICAL: ${alerts.filter(a => a.alert_level === 'CRITICAL').length}件`);
-    console.log(`   ⚠️ WARNING: ${alerts.filter(a => a.alert_level === 'WARNING').length}件`);
-    
-    // 5. BigQueryに記録
-    if (alerts.length > 0) {
-      console.log('💾 BigQueryに記録中...');
-      await saveAlertsToBigQuery(alerts);
-    }
-    
-    // 6. Slack通知（環境変数でON/OFF制御）
-    const slackEnabled = process.env.SLACK_NOTIFICATION_ENABLED === 'true';
-    
-    if (alerts.length > 0 && slackEnabled) {
-      console.log('📢 Slack通知送信中...');
-      await sendSlackNotification(alerts);
-    } else if (alerts.length > 0 && !slackEnabled) {
-      console.log('ℹ️ Slack通知はOFFに設定されています');
-    }
-    
-    // 7. 完了レスポンス
-    res.status(200).json({
-      success: true,
-      message: '在庫切れアラートチェック完了',
-      summary: {
-        total_skus_checked: salesResults.length,
-        alerts_count: alerts.length,
-        critical: alerts.filter(a => a.alert_level === 'CRITICAL').length,
-        warning: alerts.filter(a => a.alert_level === 'WARNING').length
+    const response = await axios.get(url, {
+      headers: {
+        'x-amz-access-token': accessToken,
+        'Content-Type': 'application/json'
       },
-      alerts: alerts.slice(0, 10) // 最初の10件のみレスポンスに含める
+      params: {
+        granularityType: 'Marketplace',
+        granularityId: marketplaceId,
+        marketplaceIds: marketplaceId
+      }
     });
+    
+    console.log(`✅ FBA在庫取得成功 (${marketplace}):`, response.data.payload?.inventorySummaries?.length || 0, '件');
+    return response.data.payload?.inventorySummaries || [];
     
   } catch (error) {
-    console.error('❌ エラー:', error);
+    if (error.response?.status === 429) {
+      console.warn('⚠️ レート制限に達しました。60秒待機...');
+      await new Promise(resolve => setTimeout(resolve, 60000));
+      return getFBAInventory(accessToken, marketplace, accountNum);
+    }
+    console.error('FBA在庫取得エラー:', error.response?.data || error.message);
+    throw error;
+  }
+}
+
+/**
+ * BigQueryに在庫データを保存（MERGE方式）
+ */
+async function saveInventoryToBigQuery(inventoryData) {
+  if (inventoryData.length === 0) {
+    console.log('⚠️ 保存する在庫データがありません');
+    return;
+  }
+
+  const tempTableId = 'inventory_temp_amazon_' + Date.now();
+  
+  try {
+    // 1. 一時テーブル作成
+    console.log('📝 一時テーブル作成中...');
+    const [tempTable] = await bigquery.dataset(datasetId).createTable(tempTableId, {
+      schema: [
+        { name: 'sku', type: 'STRING', mode: 'REQUIRED' },
+        { name: 'asin', type: 'STRING' },
+        { name: 'location', type: 'STRING', mode: 'REQUIRED' },
+        { name: 'location_type', type: 'STRING' },
+        { name: 'available_quantity', type: 'INTEGER' },
+        { name: 'reserved_quantity', type: 'INTEGER' },
+        { name: 'inbound_quantity', type: 'INTEGER' },
+        { name: 'total_quantity', type: 'INTEGER' },
+        { name: 'last_updated', type: 'TIMESTAMP' },
+        { name: 'sync_status', type: 'STRING' }
+      ],
+      timePartitioning: null,
+      clustering: null
+    });
+    
+    console.log(`✅ 一時テーブル作成完了: ${tempTableId}`);
+    
+    // 2. バッチinsert（500件ずつ）
+    console.log('📥 データ投入中...');
+    const batchSize = 500;
+    for (let i = 0; i < inventoryData.length; i += batchSize) {
+      const batch = inventoryData.slice(i, i + batchSize);
+      await bigquery.dataset(datasetId).table(tempTableId).insert(batch);
+      console.log(`   ${i + batch.length}/${inventoryData.length} 件投入完了`);
+    }
+    
+    // 3. 90秒待機（ストリーミングバッファ対策）
+    console.log('⏳ 90秒待機中（ストリーミングバッファ対策）...');
+    await new Promise(resolve => setTimeout(resolve, 90000));
+    
+    // 4. MERGE実行
+    console.log('🔄 MERGE実行中...');
+    const mergeQuery = `
+      MERGE \`${datasetId}.inventory\` T
+      USING (
+        SELECT DISTINCT
+          sku,
+          asin,
+          location,
+          location_type,
+          available_quantity,
+          reserved_quantity,
+          inbound_quantity,
+          total_quantity,
+          last_updated,
+          sync_status
+        FROM \`${datasetId}.${tempTableId}\`
+      ) S
+      ON T.sku = S.sku AND T.location = S.location
+      WHEN MATCHED THEN
+        UPDATE SET
+          asin = S.asin,
+          available_quantity = S.available_quantity,
+          reserved_quantity = S.reserved_quantity,
+          inbound_quantity = S.inbound_quantity,
+          total_quantity = S.total_quantity,
+          last_updated = S.last_updated,
+          sync_status = S.sync_status
+      WHEN NOT MATCHED THEN
+        INSERT (
+          sku, asin, location, location_type,
+          available_quantity, reserved_quantity, inbound_quantity, total_quantity,
+          last_updated, sync_status
+        )
+        VALUES (
+          S.sku, S.asin, S.location, S.location_type,
+          S.available_quantity, S.reserved_quantity, S.inbound_quantity, S.total_quantity,
+          S.last_updated, S.sync_status
+        )
+    `;
+    
+    const [job] = await bigquery.createQueryJob({ query: mergeQuery });
+    await job.getQueryResults();
+    console.log('✅ MERGE完了');
+    
+    // 5. 一時テーブル削除
+    await bigquery.dataset(datasetId).table(tempTableId).delete();
+    console.log('🗑️ 一時テーブル削除完了');
+    
+  } catch (error) {
+    console.error('❌ BigQuery保存エラー:', error);
+    // エラー時も一時テーブルを削除
+    try {
+      await bigquery.dataset(datasetId).table(tempTableId).delete();
+    } catch (e) {}
+    throw error;
+  }
+}
+
+/**
+ * メイン処理
+ */
+exports.syncAmazonFBAInventory = async (req, res) => {
+  console.log('🚀 Amazon FBA在庫同期開始');
+  console.log('📅 実行日時:', new Date().toISOString());
+  
+  const accountNum = req.query.account || '1';
+  const marketplace = req.query.marketplace || 'JP';
+  
+  console.log(`📦 アカウント${accountNum} (${marketplace})`);
+  
+  try {
+    // 環境変数取得
+    const clientId = process.env[`AMAZON_${marketplace}_CLIENT_ID_${accountNum}`];
+    const clientSecret = process.env[`AMAZON_${marketplace}_CLIENT_SECRET_${accountNum}`];
+    const refreshToken = process.env[`AMAZON_${marketplace}_REFRESH_TOKEN_${accountNum}`];
+    const accountName = process.env[`ACCOUNT_NAME_${accountNum}`] || `Amazon ${marketplace} ${accountNum}`;
+    
+    if (!clientId || !clientSecret || !refreshToken) {
+      throw new Error(`環境変数が設定されていません (アカウント${accountNum}, ${marketplace})`);
+    }
+    
+    // 1. Access Token取得
+    console.log('🔐 Access Token取得中...');
+    const accessToken = await getAccessToken(clientId, clientSecret, refreshToken);
+    console.log('✅ Access Token取得完了');
+    
+    // 2. FBA在庫データ取得
+    console.log('📦 FBA在庫データ取得中...');
+    const inventorySummaries = await getFBAInventory(accessToken, marketplace, accountNum);
+    
+    if (inventorySummaries.length === 0) {
+      console.log('⚠️ 在庫データが0件でした');
+      res.status(200).json({
+        success: true,
+        message: '在庫データが0件でした',
+        account: accountName,
+        marketplace: marketplace,
+        count: 0
+      });
+      return;
+    }
+    
+    // 3. データ整形
+    console.log('🔄 データ整形中...');
+    const inventoryData = inventorySummaries.map(item => {
+      const sku = item.sellerSku || item.fnSku;
+      const asin = item.asin;
+      const condition = item.condition || 'NEW';
+      
+      return {
+        sku: sku,
+        asin: asin,
+        location: `FBA-${marketplace}-${accountNum}`,
+        location_type: 'FBA',
+        available_quantity: item.totalQuantity || 0,
+        reserved_quantity: item.reservedQuantity?.totalReservedQuantity || 0,
+        inbound_quantity: item.inboundWorkingQuantity || 0,
+        total_quantity: (item.totalQuantity || 0) + (item.inboundWorkingQuantity || 0),
+        last_updated: new Date().toISOString(),
+        sync_status: 'success'
+      };
+    });
+    
+    console.log(`✅ データ整形完了: ${inventoryData.length}件`);
+    
+    // 4. BigQueryに保存
+    console.log('💾 BigQueryに保存中...');
+    await saveInventoryToBigQuery(inventoryData);
+    console.log('✅ BigQuery保存完了');
+    
+    // 5. 完了レスポンス
+    const response = {
+      success: true,
+      message: 'Amazon FBA在庫同期完了',
+      account: accountName,
+      marketplace: marketplace,
+      inventoryCount: inventoryData.length,
+      timestamp: new Date().toISOString()
+    };
+    
+    console.log('🎉 同期完了:', response);
+    res.status(200).json(response);
+    
+  } catch (error) {
+    console.error('❌ エラー発生:', error);
     res.status(500).json({
       success: false,
       error: error.message,
@@ -185,108 +275,3 @@ exports.checkStockoutAlert = async (req, res) => {
     });
   }
 };
-
-/**
- * アラートをBigQueryに保存
- */
-async function saveAlertsToBigQuery(alerts) {
-  const records = alerts.map(alert => ({
-    sku: alert.master_sku,  // stockout_alertテーブルのskuカラムにmaster_skuを保存
-    location: 'ALL', // 全拠点合計
-    predicted_stockout_date: calculateStockoutDate(alert.days_until_stockout),
-    current_stock: alert.current_stock,
-    daily_sales_rate: alert.daily_sales_rate,
-    days_until_stockout: alert.days_until_stockout,
-    alert_level: alert.alert_level,
-    suggested_order_qty: Math.max(0, alert.suggested_order_qty),
-    calculated_at: new Date().toISOString()
-  }));
-  
-  // バッチinsert
-  const batchSize = 500;
-  for (let i = 0; i < records.length; i += batchSize) {
-    const batch = records.slice(i, i + batchSize);
-    await bigquery.dataset(datasetId).table('stockout_alert').insert(batch);
-  }
-  
-  console.log(`✅ BigQueryに${records.length}件保存完了`);
-}
-
-/**
- * Slack通知送信
- */
-async function sendSlackNotification(alerts) {
-  const webhookUrl = process.env.SLACK_WEBHOOK_URL;
-  
-  if (!webhookUrl) {
-    console.warn('⚠️ SLACK_WEBHOOK_URLが設定されていません');
-    return;
-  }
-  
-  // Critical のみ通知（多すぎる場合は上位10件）
-  const criticalAlerts = alerts
-    .filter(a => a.alert_level === 'CRITICAL')
-    .slice(0, 10);
-  
-  const warningCount = alerts.filter(a => a.alert_level === 'WARNING').length;
-  
-  if (criticalAlerts.length === 0 && warningCount === 0) {
-    return;
-  }
-  
-  // Slackメッセージ作成
-  const blocks = [
-    {
-      type: 'header',
-      text: {
-        type: 'plain_text',
-        text: '🚨 在庫切れアラート'
-      }
-    },
-    {
-      type: 'section',
-      text: {
-        type: 'mrkdwn',
-        text: `*サマリー*\n🔴 Critical: ${criticalAlerts.length}件\n⚠️ Warning: ${warningCount}件`
-      }
-    },
-    {
-      type: 'divider'
-    }
-  ];
-  
-  // Critical アラート詳細
-  criticalAlerts.forEach(alert => {
-    blocks.push({
-      type: 'section',
-      text: {
-        type: 'mrkdwn',
-        text: `*${alert.product_name}*\n` +
-              `Master SKU: \`${alert.master_sku}\`\n` +
-              `${alert.message}\n` +
-              `現在庫: ${alert.current_stock}個 | 入庫予定: ${alert.inbound_stock}個\n` +
-              `日次平均販売: ${alert.daily_sales_rate}個/日\n` +
-              `📦 推奨発注数: ${Math.max(0, alert.suggested_order_qty)}個`
-      }
-    });
-  });
-  
-  // Slack送信
-  try {
-    await axios.post(webhookUrl, {
-      blocks: blocks
-    });
-    console.log('✅ Slack通知送信完了');
-  } catch (error) {
-    console.error('❌ Slack通知送信エラー:', error.message);
-  }
-}
-
-/**
- * 在庫切れ予測日を計算
- */
-function calculateStockoutDate(daysUntilStockout) {
-  const date = new Date();
-  date.setDate(date.getDate() + daysUntilStockout);
-  return date.toISOString().split('T')[0]; // YYYY-MM-DD形式
-}

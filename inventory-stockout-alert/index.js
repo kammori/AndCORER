@@ -153,10 +153,14 @@ exports.checkStockoutAlert = async (req, res) => {
       await saveAlertsToBigQuery(alerts);
     }
     
-    // 6. Slack通知
-    if (alerts.length > 0) {
+    // 6. Slack通知（環境変数でON/OFF制御）
+    const slackEnabled = process.env.SLACK_NOTIFICATION_ENABLED === 'true';
+    
+    if (alerts.length > 0 && slackEnabled) {
       console.log('📢 Slack通知送信中...');
       await sendSlackNotification(alerts);
+    } else if (alerts.length > 0 && !slackEnabled) {
+      console.log('ℹ️ Slack通知はOFFに設定されています');
     }
     
     // 7. 完了レスポンス
