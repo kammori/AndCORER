@@ -162,17 +162,15 @@ async function fetchProductMaster() {
   try {
     console.log('商品マスタ（SKU紐付け + ケース情報）取得中...');
     
-    // channel_settings（SKU紐付け）とproduct_master（ケース情報）をJOIN
+    // channel_settingsから取得（ロジスピのSKU紐付け＋ケース情報）
     const query = `
       SELECT 
         cs.channel_sku,
         cs.master_sku,
         cs.account_name,
-        COALESCE(pm.is_case_product, FALSE) as is_case_product,
-        COALESCE(pm.units_per_case, 1) as units_per_case
+        COALESCE(cs.is_case_unit, FALSE) as is_case_unit,
+        COALESCE(cs.units_per_case, 1) as units_per_case
       FROM \`${datasetId}.channel_settings\` cs
-      LEFT JOIN \`${datasetId}.${productMasterTableId}\` pm
-        ON cs.master_sku = pm.master_sku
       WHERE cs.account_name = 'ロジスピ'
         AND cs.is_enabled = TRUE
     `;
@@ -187,11 +185,11 @@ async function fetchProductMaster() {
     rows.forEach(row => {
       masterMap[row.channel_sku] = {
         master_sku: row.master_sku,
-        is_case_product: row.is_case_product,
+        is_case_unit: row.is_case_unit,
         units_per_case: row.units_per_case || 1
       };
       
-      console.log(`  マッピング: ${row.channel_sku} → ${row.master_sku} (ケース: ${row.is_case_product}, 倍率: ${row.units_per_case})`);
+      console.log(`  マッピング: ${row.channel_sku} → ${row.master_sku} (ケース単位: ${row.is_case_unit}, 倍率: ${row.units_per_case})`);
     });
     
     console.log(`✅ ロジスピSKUマップ登録数: ${Object.keys(masterMap).length}`);
@@ -253,7 +251,7 @@ function convertInventoryData(inventoryData, productMaster) {
     const originalQuantity = quantity;
     
     // ケース商品の場合、個数に変換
-    if (product.is_case_product && product.units_per_case > 1) {
+    if (product.is_case_unit && product.units_per_case > 1) {
       console.log(`✅ ケース変換: ${sku} → ${quantity}ケース × ${product.units_per_case}個 = ${quantity * product.units_per_case}個 → master_sku: ${finalSku}`);
       quantity = quantity * product.units_per_case;
       isCaseConverted = true;
