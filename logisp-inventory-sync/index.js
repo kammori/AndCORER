@@ -23,19 +23,32 @@ const inventoryTableId = 'inventory';
 const productMasterTableId = 'product_master';
 
 // ロジスピAPI設定
-const LOGISP_API_URL = 'https://asia-northeast1-logisp-production.cloudfunctions.net/inventories';
+// 注意: 実際のロジスピAPIのURLを確認してください
+// 環境変数で上書き可能
+const LOGISP_API_URL = process.env.LOGISP_API_URL || 
+  'https://asia-northeast1-logisp-production.cloudfunctions.net/inventories';
+
+console.log('ロジスピAPI URL:', LOGISP_API_URL);
 
 functions.http('syncLogispInventory', async (req, res) => {
   const startTime = Date.now();
   
   try {
     console.log('=== ロジスピ在庫同期開始 ===');
+    console.log('Environment check...');
     
     // 環境変数チェック
     const apiKey = process.env.LOGISP_API_KEY;
     if (!apiKey) {
-      throw new Error('環境変数 LOGISP_API_KEY が設定されていません');
+      const error = '環境変数 LOGISP_API_KEY が設定されていません';
+      console.error('❌ ERROR:', error);
+      return res.status(500).json({
+        success: false,
+        error: error,
+        hint: 'Cloud Functionsの環境変数にLOGISP_API_KEYを設定してください'
+      });
     }
+    console.log('✅ API Key found');
     
     // Step 1: ロジスピAPIから在庫取得
     console.log('ロジスピAPIから在庫取得中...');
@@ -98,6 +111,9 @@ functions.http('syncLogispInventory', async (req, res) => {
  */
 async function fetchLogispInventory(apiKey) {
   try {
+    console.log('ロジスピAPI呼び出し中...');
+    console.log('URL:', LOGISP_API_URL);
+    
     const response = await axios.get(LOGISP_API_URL, {
       headers: {
         'X-API-Key': apiKey
@@ -105,28 +121,35 @@ async function fetchLogispInventory(apiKey) {
       timeout: 30000 // 30秒タイムアウト
     });
     
-    // レスポンス形式の確認
-    console.log('API Response Status:', response.status);
-    console.log('API Response Sample:', JSON.stringify(response.data).slice(0, 200));
+    console.log('✅ API Response Status:', response.status);
+    console.log('API Response Sample:', JSON.stringify(response.data).slice(0, 300));
     
     // データ形式に応じて処理
-    // 想定: { inventories: [{sku: "xxx", quantity: 10}, ...] } or 配列直接
     const inventories = response.data.inventories || response.data;
     
     if (!Array.isArray(inventories)) {
-      throw new Error('APIレスポンスが配列ではありません');
+      console.error('❌ APIレスポンスが配列ではありません:', typeof inventories);
+      console.error('Response:', JSON.stringify(response.data));
+      throw new Error(`APIレスポンスが配列ではありません: ${typeof inventories}`);
     }
     
+    console.log(`✅ 在庫データ取得成功: ${inventories.length}件`);
     return inventories;
     
   } catch (error) {
     if (error.response) {
       // APIからのエラーレスポンス
+      console.error('❌ ロジスピAPI Error Response:');
+      console.error('  Status:', error.response.status);
+      console.error('  Data:', JSON.stringify(error.response.data));
       throw new Error(`ロジスピAPI Error ${error.response.status}: ${JSON.stringify(error.response.data)}`);
     } else if (error.request) {
       // リクエストが送信されたがレスポンスなし
-      throw new Error('ロジスピAPIへの接続タイムアウト');
+      console.error('❌ ロジスピAPIへの接続タイムアウト');
+      console.error('  Request config:', error.config);
+      throw new Error('ロジスピAPIへの接続タイムアウト（30秒）');
     } else {
+      console.error('❌ リクエスト設定エラー:', error.message);
       throw error;
     }
   }
@@ -136,59 +159,53 @@ async function fetchLogispInventory(apiKey) {
  * 商品マスタ取得（ケース変換情報含む）
  */
 async function fetchProductMaster() {
-  const query = `
-    SELECT 
-      master_sku,
-      is_case_product,
-      units_per_case,
-      case_sku
-    FROM \`${datasetId}.${productMasterTableId}\`
-  `;
-  
-  const [rows] = await bigquery.query(query);
-  
-  // SKUをキーとしたマップに変換（channel_sku と case_sku の両方に対応）
-  const masterMap = {};
-  
-  rows.forEach(row => {
-    // master_sku自体をキーとして登録
-    masterMap[row.master_sku] = row;
+  try {
+    console.log('商品マスタ（SKU紐付け + ケース情報）取得中...');
     
-    // case_sku がある場合、それもキーとして登録
-    if (row.case_sku) {
-      masterMap[row.case_sku] = row;
-    }
-  });
-  
-  // channel_settings も取得して追加
-  const channelQuery = `
-    SELECT 
-      cs.channel_sku,
-      cs.master_sku,
-      pm.is_case_product,
-      pm.units_per_case,
-      pm.case_sku
-    FROM \`${datasetId}.channel_settings\` cs
-    LEFT JOIN \`${datasetId}.${productMasterTableId}\` pm
-      ON cs.master_sku = pm.master_sku
-  `;
-  
-  const [channelRows] = await bigquery.query(channelQuery);
-  
-  channelRows.forEach(row => {
-    if (row.channel_sku) {
+    // channel_settings（SKU紐付け）とproduct_master（ケース情報）をJOIN
+    const query = `
+      SELECT 
+        cs.channel_sku,
+        cs.master_sku,
+        cs.account_name,
+        COALESCE(pm.is_case_product, FALSE) as is_case_product,
+        COALESCE(pm.units_per_case, 1) as units_per_case
+      FROM \`${datasetId}.channel_settings\` cs
+      LEFT JOIN \`${datasetId}.${productMasterTableId}\` pm
+        ON cs.master_sku = pm.master_sku
+      WHERE cs.account_name = 'ロジスピ'
+        AND cs.is_enabled = TRUE
+    `;
+    
+    const [rows] = await bigquery.query(query);
+    
+    console.log(`✅ クエリ実行成功: ${rows.length}件`);
+    
+    // channel_sku をキーとしたマップに変換
+    const masterMap = {};
+    
+    rows.forEach(row => {
       masterMap[row.channel_sku] = {
         master_sku: row.master_sku,
         is_case_product: row.is_case_product,
-        units_per_case: row.units_per_case,
-        case_sku: row.case_sku
+        units_per_case: row.units_per_case || 1
       };
+      
+      console.log(`  マッピング: ${row.channel_sku} → ${row.master_sku} (ケース: ${row.is_case_product}, 倍率: ${row.units_per_case})`);
+    });
+    
+    console.log(`✅ ロジスピSKUマップ登録数: ${Object.keys(masterMap).length}`);
+    
+    if (Object.keys(masterMap).length === 0) {
+      console.warn('⚠️  ロジスピのSKU紐付けが0件です。channel_settingsに登録してください。');
     }
-  });
-  
-  console.log(`商品マスタマップ登録SKU数: ${Object.keys(masterMap).length}`);
-  
-  return masterMap;
+    
+    return masterMap;
+    
+  } catch (error) {
+    console.error('❌ 商品マスタ取得エラー:', error.message);
+    throw new Error(`商品マスタ取得失敗: ${error.message}`);
+  }
 }
 
 /**
@@ -200,28 +217,48 @@ function convertInventoryData(inventoryData, productMaster) {
   
   inventoryData.forEach(item => {
     // APIレスポンスのフィールド名を想定
-    // 実際のAPI仕様に応じて調整が必要
     const sku = item.sku || item.SKU || item.itemCode;
     let quantity = parseInt(item.quantity || item.stock || item.available || 0);
     
     if (!sku) {
-      console.warn('SKUが見つかりません:', item);
+      console.warn('⚠️  SKUが見つかりません:', item);
       return;
     }
     
-    // 商品マスタから情報取得
+    // channel_settingsから情報取得
     const product = productMaster[sku];
+    
+    if (!product) {
+      // マッピングが見つからない場合は警告（スキップしない）
+      console.warn(`⚠️  SKUマッピングが見つかりません: ${sku} - そのまま保存します`);
+      rows.push({
+        sku: sku,
+        location: 'ロジスピ',
+        location_type: 'External',
+        available_quantity: quantity,
+        reserved_quantity: 0,
+        inbound_quantity: 0,
+        total_quantity: quantity,
+        last_updated: now,
+        sync_status: 'success',
+        is_case_converted: false,
+        original_sku: sku,
+        original_quantity: quantity
+      });
+      return;
+    }
+    
     let isCaseConverted = false;
-    let finalSku = sku;
+    const finalSku = product.master_sku;
+    const originalQuantity = quantity;
     
     // ケース商品の場合、個数に変換
-    if (product && product.is_case_product && product.units_per_case > 1) {
-      console.log(`ケース変換: ${sku} → ${quantity}ケース × ${product.units_per_case}個 = ${quantity * product.units_per_case}個`);
+    if (product.is_case_product && product.units_per_case > 1) {
+      console.log(`✅ ケース変換: ${sku} → ${quantity}ケース × ${product.units_per_case}個 = ${quantity * product.units_per_case}個 → master_sku: ${finalSku}`);
       quantity = quantity * product.units_per_case;
       isCaseConverted = true;
-      
-      // master_skuを使用
-      finalSku = product.master_sku || sku;
+    } else {
+      console.log(`✅ SKU紐付け: ${sku} → master_sku: ${finalSku} (${quantity}個)`);
     }
     
     rows.push({
@@ -236,7 +273,7 @@ function convertInventoryData(inventoryData, productMaster) {
       sync_status: 'success',
       is_case_converted: isCaseConverted,
       original_sku: sku,
-      original_quantity: item.quantity || item.stock || item.available
+      original_quantity: originalQuantity
     });
   });
   
